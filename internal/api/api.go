@@ -7,11 +7,14 @@
 // package, where it is exercised by both surfaces.
 //
 // Mutating endpoints require a bearer token and the server refuses to start
-// without one; see auth.go.
+// without one; see auth.go. Every route declares the scope it needs in the
+// table returned by handlers.routes, and a test walks the built router to
+// prove no route was added around that table.
 package api
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +26,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/soroworks/soroforge/internal/deploy"
+	"github.com/soroworks/soroforge/internal/readiness"
 	"github.com/soroworks/soroforge/internal/store"
 )
 
@@ -36,9 +40,22 @@ type Service interface {
 	Upgrade(ctx context.Context, req deploy.UpgradeRequest) (*deploy.UpgradeResult, error)
 	Status(ctx context.Context, req deploy.StatusRequest) (*deploy.StatusResult, error)
 	StatusAll(ctx context.Context, network string) (*deploy.NetworkStatus, error)
-	List(ctx context.Context, network string) ([]store.Contract, error)
-	History(ctx context.Context, network, alias string) ([]store.Deployment, error)
+	ListPage(ctx context.Context, network string, limit, offset int) ([]store.Contract, error)
+	HistoryPage(ctx context.Context, network, alias string, limit, offset int) ([]store.Deployment, error)
 }
+
+// Readiness reports whether SoroForge's dependencies are usable. It backs
+// GET /ready.
+//
+// It is declared here as a one-method interface so the handlers cannot reach
+// past it into a database or RPC client: the API package checks dependencies
+// through this seam, never directly.
+type Readiness interface {
+	Check(ctx context.Context) readiness.Status
+}
+
+//go:embed openapi.json
+var openAPIDocument []byte
 
 // requestTimeout bounds a single API request.
 //
@@ -47,30 +64,81 @@ type Service interface {
 // indefinitely.
 const requestTimeout = 5 * time.Minute
 
+// maxRequestBodyBytes caps the request body of the mutating endpoints.
+//
+// Deploy and upgrade bodies are a handful of small fields — an alias, a
+// network, a wasm path or hash, free-text notes — so 64 KiB leaves orders of
+// magnitude of headroom. Without a cap, an authenticated but misbehaving
+// client could make the server buffer an arbitrarily large body; with one,
+// the decoder is stopped at the limit instead.
+const maxRequestBodyBytes = 64 << 10 // 64 KiB
+
 // Options configures the HTTP server.
 type Options struct {
 	// Service performs the work. Required.
 	Service Service
 
-	// Token is the bearer token required by mutating endpoints. The server
-	// refuses to start if it is empty or too short.
-	Token string
+	// Tokens are the bearer credentials the API accepts. At least one is
+	// required; the server refuses to start without one.
+	Tokens []Token
+
+	// Readiness checks dependencies for GET /ready. Required.
+	Readiness Readiness
 
 	// Log defaults to slog.Default().
 	Log *slog.Logger
 }
 
+// route is one endpoint, the scope a token must hold to call it, and its
+// handler.
+type route struct {
+	method  string
+	pattern string
+	scope   Scope
+	handler http.HandlerFunc
+}
+
+// routes returns every endpoint the API serves, each with its required scope.
+//
+// This table is the single place route permissions are declared: NewRouter
+// mounts exactly these entries, wrapping each in the middleware for its scope,
+// and TestEveryRouteHasAScope walks the finished router to prove nothing was
+// added around it. A new endpoint that forgets to declare its scope fails the
+// test rather than silently inheriting access.
+//
+// ScopePublic routes (/health and /ready) deliberately take no token: a
+// monitoring system should not need to hold a credential that can deploy in
+// order to ask whether the process is alive or ready.
+func (h *handlers) routes() []route {
+	return []route{
+		{http.MethodGet, "/health", ScopePublic, h.health},
+		{http.MethodGet, "/ready", ScopePublic, h.ready},
+		{http.MethodGet, "/openapi.json", ScopePublic, h.openapi},
+
+		{http.MethodPost, "/v1/deploy", ScopeWrite, h.deploy},
+		{http.MethodPost, "/v1/upgrade", ScopeWrite, h.upgrade},
+
+		{http.MethodGet, "/v1/contracts", ScopeRead, h.listContracts},
+		{http.MethodGet, "/v1/contracts/{network}/{alias}/history", ScopeRead, h.history},
+		{http.MethodGet, "/v1/contracts/{network}/{alias}/status", ScopeRead, h.status},
+		{http.MethodGet, "/v1/contracts/{network}/status", ScopeRead, h.statusAll},
+	}
+}
+
 // NewRouter builds the HTTP handler.
 //
-// It returns an error rather than a router when the token is unusable, so that
-// a misconfigured server fails at startup instead of serving unauthenticated
-// deploy endpoints.
+// It returns an error rather than a router when the tokens are unusable or a
+// required dependency is missing, so that a misconfigured server fails at
+// startup instead of serving unauthenticated deploy endpoints.
 func NewRouter(opts Options) (http.Handler, error) {
 	if opts.Service == nil {
 		return nil, fmt.Errorf("api: service is required")
 	}
-	if err := validateToken(opts.Token); err != nil {
+	if err := validateTokens(opts.Tokens); err != nil {
 		return nil, err
+	}
+	if opts.Readiness == nil {
+		return nil, fmt.Errorf("api: readiness is required")
 	}
 
 	log := opts.Log
@@ -78,30 +146,80 @@ func NewRouter(opts Options) (http.Handler, error) {
 		log = slog.Default()
 	}
 
-	h := &handlers{svc: opts.Service, log: log}
+	h := &handlers{svc: opts.Service, readiness: opts.Readiness, log: log}
+	auth := &authenticator{tokens: opts.Tokens}
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	// The access log wraps the recoverer so a panic's 500 is logged with its
+	// status like any other response.
+	r.Use(accessLog(log))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(requestTimeout))
 
-	// Unauthenticated: a liveness probe must work without distributing the
-	// deploy token to every monitoring system.
-	r.Get("/health", h.health)
-
-	r.Route("/v1", func(r chi.Router) {
-		r.Use(BearerAuth(opts.Token))
-
-		r.Post("/deploy", h.deploy)
-		r.Post("/upgrade", h.upgrade)
-
-		r.Get("/contracts", h.listContracts)
-		r.Get("/contracts/{network}/{alias}/history", h.history)
-		r.Get("/contracts/{network}/{alias}/status", h.status)
-		r.Get("/contracts/{network}/status", h.statusAll)
-	})
+	for _, rt := range h.routes() {
+		r.With(auth.authorize(rt.scope, rt.pattern)).Method(rt.method, rt.pattern, rt.handler)
+	}
 
 	return r, nil
+}
+
+// accessLog returns middleware that writes one structured line per request.
+//
+// It never logs headers or bodies: the Authorization header carries the bearer
+// token, and a deploy body can contain anything. Logging the matched token's
+// name is enough to answer "who deployed this" without the value appearing
+// anywhere.
+//
+// Requests to /health are logged at debug level so that a liveness probe
+// polling every second cannot bury real traffic.
+func accessLog(log *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			info, r := withRequestInfo(r)
+
+			start := time.Now()
+			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+			next.ServeHTTP(ww, r)
+
+			status := ww.Status()
+			if status == 0 {
+				// The handler wrote nothing — the implicit status is 200.
+				status = http.StatusOK
+			}
+
+			pattern := routePattern(r)
+			attrs := []slog.Attr{
+				slog.String("method", r.Method),
+				slog.String("route", pattern),
+				slog.Int("status", status),
+				slog.Duration("duration", time.Since(start)),
+				slog.String("request_id", middleware.GetReqID(r.Context())),
+				slog.String("remote_addr", r.RemoteAddr),
+			}
+			if info.tokenName != "" {
+				attrs = append(attrs, slog.String("token", info.tokenName))
+			}
+
+			level := slog.LevelInfo
+			if pattern == "/health" {
+				level = slog.LevelDebug
+			}
+			log.LogAttrs(r.Context(), level, "http request", attrs...)
+		})
+	}
+}
+
+// routePattern returns the matched chi pattern, so logs say
+// /v1/contracts/{network}/{alias}/status rather than one line per path. For a
+// request that matched nothing, the raw path is the only useful answer.
+func routePattern(r *http.Request) string {
+	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if pattern := rctx.RoutePattern(); pattern != "" {
+			return pattern
+		}
+	}
+	return r.URL.Path
 }
 
 // NewServer builds an http.Server with sensible timeouts.
@@ -121,8 +239,9 @@ func NewServer(addr string, handler http.Handler) *http.Server {
 }
 
 type handlers struct {
-	svc Service
-	log *slog.Logger
+	svc       Service
+	readiness Readiness
+	log       *slog.Logger
 }
 
 // errorResponse is the body returned for every failure, so clients can parse
@@ -146,6 +265,16 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, errorResponse{Error: message})
 }
 
+// decodeBody caps the request body and decodes it as JSON.
+//
+// The cap is applied before json.NewDecoder reads anything, so an oversized
+// body is refused rather than buffered, and the *http.MaxBytesError it
+// produces lets writeDecodeError answer 413 instead of a generic 400.
+func decodeBody(w http.ResponseWriter, r *http.Request, dest any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	return decodeJSON(r, dest)
+}
+
 // decodeJSON reads a request body, rejecting unknown fields so that a
 // misspelled key is a clear 400 rather than a silently ignored option — the
 // same reasoning as KnownFields in the config loader.
@@ -156,6 +285,21 @@ func decodeJSON(r *http.Request, dest any) error {
 		return fmt.Errorf("invalid request body: %w", err)
 	}
 	return nil
+}
+
+// writeDecodeError writes the response for a body that could not be decoded.
+//
+// A body over the cap is a 413: the request is well-formed, just too large to
+// accept, and that is the code clients and proxies already understand for it.
+// Everything else is the 400 used for malformed JSON or an unknown field.
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("request body exceeds the %d byte limit", maxRequestBodyBytes))
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error())
 }
 
 // statusForError maps an operation error to an HTTP status.

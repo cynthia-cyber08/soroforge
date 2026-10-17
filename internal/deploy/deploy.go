@@ -5,11 +5,34 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"strings"
+	"time"
 
 	"github.com/soroworks/soroforge/internal/config"
 	"github.com/soroworks/soroforge/internal/stellar"
 	"github.com/soroworks/soroforge/internal/store"
 )
+
+func gitMetadata(dir, override string) (string, bool) {
+	commit := override
+	if commit == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
+		cmd.Dir = dir
+		if output, err := cmd.Output(); err == nil {
+			commit = strings.TrimSpace(string(output))
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain")
+	cmd.Dir = dir
+	output, err := cmd.Output()
+	return commit, err == nil && len(strings.TrimSpace(string(output))) > 0
+}
 
 // DeployRequest asks for a contract to be deployed.
 type DeployRequest struct {
@@ -25,6 +48,9 @@ type DeployRequest struct {
 	// DryRun assembles and simulates the transactions but submits nothing and
 	// records nothing.
 	DryRun bool `json:"dry_run,omitempty"`
+
+	// GitCommit overrides automatic commit detection, for detached CI checkouts.
+	GitCommit string `json:"git_commit,omitempty"`
 }
 
 // DeployResult describes a completed or simulated deploy.
@@ -106,42 +132,16 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 		DryRun:   req.DryRun,
 	}
 
-	salt, err := s.salt(r.Contract)
+	// Step 1: upload the bytecode, unless it is already on-chain.
+	upload, skipped, err := s.uploadBytecode(ctx, r, signer, wasm, req.DryRun, log)
 	if err != nil {
 		return nil, err
 	}
-
-	// A fixed salt makes the target address deterministic, so a collision can
-	// be caught before the bytecode upload is paid for. A random salt cannot
-	// collide in any way worth checking, so that path skips the lookup.
-	if r.Contract.Salt != "" {
-		if err := s.checkTargetFree(ctx, r, signer.Address(), salt); err != nil {
-			return nil, err
-		}
-	}
-
-	fees := &DryRunFees{}
-
-	// Step 1: upload the bytecode, unless it is already on-chain. Uploading is
-	// content-addressed, so an identical upload is a no-op that still costs a
-	// transaction and a fee.
-	uploaded, err := stellar.WasmUploaded(ctx, r.Client, wasmHash)
-	if err != nil {
-		return nil, fmt.Errorf("check whether wasm is already uploaded: %w", err)
-	}
-	if uploaded {
-		log.Info("wasm already on-chain, skipping upload")
+	if skipped {
 		result.UploadSkipped = true
 	} else {
-		upload, err := s.runTransaction(ctx, r,
-			stellar.UploadWasmOp(wasm, signer.Address()), "upload", req.DryRun)
-		if err != nil {
-			return nil, fmt.Errorf("upload wasm: %w", err)
-		}
 		result.UploadTxHash = upload.Hash
 		result.UploadEnvelopeXDR = upload.EnvelopeXDR
-		fees.Upload = &upload.Fee
-		log.Info("wasm uploaded", "tx_hash", upload.Hash)
 	}
 
 	// Step 2: instantiate a contract from the uploaded bytecode.
@@ -183,6 +183,8 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 	log.Info("contract created", "contract_id", contractID, "tx_hash", create.Hash)
 
 	// Record only now, after the network has confirmed both transactions.
+	gitCommit, dirty := gitMetadata(s.cfg.Dir(), req.GitCommit)
+
 	deployment, err := s.record(ctx, store.Deployment{
 		Alias:          r.Alias,
 		Network:        r.NetworkName,
@@ -193,6 +195,9 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 		TxHash:         create.Hash,
 		Ledger:         create.Ledger,
 		Notes:          req.Notes,
+		GitCommit:      gitCommit,
+		Dirty:          dirty,
+		FeeCharged:     create.FeeCharged,
 	})
 	if err != nil {
 		return nil, err

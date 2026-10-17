@@ -131,6 +131,36 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) store.Store) {
 		assert.Empty(t, got)
 	})
 
+	t.Run("contract pages retain list ordering", func(t *testing.T) {
+		s := newStore(t)
+		for _, c := range []store.Contract{
+			{Alias: "b", Network: "testnet", ContractID: "C2", CurrentWasmHash: "b"},
+			{Alias: "a", Network: "testnet", ContractID: "C1", CurrentWasmHash: "a"},
+			{Alias: "c", Network: "mainnet", ContractID: "C3", CurrentWasmHash: "c"},
+		} {
+			_, err := s.UpsertContract(ctx, c)
+			require.NoError(t, err)
+		}
+
+		first, err := s.ListContractsPage(ctx, "", 2, 0)
+		require.NoError(t, err)
+		require.Len(t, first, 2)
+		assert.Equal(t, []string{"mainnet", "testnet"}, []string{first[0].Network, first[1].Network})
+
+		last, err := s.ListContractsPage(ctx, "", 2, 2)
+		require.NoError(t, err)
+		require.Len(t, last, 1)
+		assert.Equal(t, "b", last[0].Alias)
+	})
+
+	t.Run("page arguments must be valid", func(t *testing.T) {
+		s := newStore(t)
+		_, err := s.ListContractsPage(ctx, "", 0, 0)
+		assert.ErrorContains(t, err, "limit")
+		_, err = s.HistoryPage(ctx, "testnet", "counter", 1, -1)
+		assert.ErrorContains(t, err, "offset")
+	})
+
 	t.Run("history records deploys and upgrades newest first", func(t *testing.T) {
 		s := newStore(t)
 
@@ -195,6 +225,27 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) store.Store) {
 		assert.Empty(t, history)
 	})
 
+	t.Run("history pages preserve newest-first order", func(t *testing.T) {
+		s := newStore(t)
+		for _, hash := range []string{"v1", "v2", "v3"} {
+			_, err := s.RecordDeployment(ctx, store.Deployment{
+				Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: hash,
+				Action: store.ActionDeploy, DeployerPubkey: "GABC",
+			})
+			require.NoError(t, err)
+		}
+
+		first, err := s.HistoryPage(ctx, "testnet", "counter", 2, 0)
+		require.NoError(t, err)
+		require.Len(t, first, 2)
+		assert.Equal(t, []string{"v3", "v2"}, []string{first[0].WasmHash, first[1].WasmHash})
+
+		last, err := s.HistoryPage(ctx, "testnet", "counter", 2, 2)
+		require.NoError(t, err)
+		require.Len(t, last, 1)
+		assert.Equal(t, "v1", last[0].WasmHash)
+	})
+
 	t.Run("optional deployment fields survive a round trip when absent", func(t *testing.T) {
 		// tx_hash, ledger, and notes are nullable; a dry run or a failed
 		// submission leaves them unset and reading them back must not error.
@@ -212,6 +263,47 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) store.Store) {
 		assert.Empty(t, history[0].TxHash)
 		assert.Zero(t, history[0].Ledger)
 		assert.Empty(t, history[0].Notes)
+	})
+
+	t.Run("an upload is recorded without a contract id", func(t *testing.T) {
+		// Uploading installs bytecode, which has no contract address of its
+		// own. The record must round-trip with the field empty and still appear
+		// in the alias's history.
+		s := newStore(t)
+
+		_, err := s.RecordDeployment(ctx, store.Deployment{
+			Alias: "counter", Network: "testnet", WasmHash: "c0ffee",
+			Action: store.ActionUpload, DeployerPubkey: "GABC",
+			TxHash: "tx-upload", Ledger: 300,
+		})
+		require.NoError(t, err)
+
+		history, err := s.History(ctx, "testnet", "counter")
+		require.NoError(t, err)
+		require.Len(t, history, 1)
+		assert.Equal(t, store.ActionUpload, history[0].Action)
+		assert.Empty(t, history[0].ContractID)
+		assert.Equal(t, "tx-upload", history[0].TxHash)
+		assert.Equal(t, uint32(300), history[0].Ledger)
+	})
+
+	t.Run("fee and source metadata survive a round trip", func(t *testing.T) {
+		s := newStore(t)
+		fee := int64(123456)
+		_, err := s.RecordDeployment(ctx, store.Deployment{
+			Alias: "counter", Network: "testnet", ContractID: "C1", WasmHash: "a",
+			Action: store.ActionDeploy, DeployerPubkey: "GABC", GitCommit: "abc123", Dirty: true,
+			FeeCharged: &fee,
+		})
+		require.NoError(t, err)
+
+		history, err := s.History(ctx, "testnet", "counter")
+		require.NoError(t, err)
+		require.Len(t, history, 1)
+		assert.Equal(t, "abc123", history[0].GitCommit)
+		assert.True(t, history[0].Dirty)
+		require.NotNil(t, history[0].FeeCharged)
+		assert.Equal(t, fee, *history[0].FeeCharged)
 	})
 
 	t.Run("invalid records are rejected", func(t *testing.T) {
@@ -263,6 +355,7 @@ func TestMemoryStoreHistoryOrdersByIDWhenTimestampsTie(t *testing.T) {
 func TestActionValid(t *testing.T) {
 	assert.True(t, store.ActionDeploy.Valid())
 	assert.True(t, store.ActionUpgrade.Valid())
+	assert.True(t, store.ActionUpload.Valid())
 	assert.False(t, store.Action("rollback").Valid())
 	assert.False(t, store.Action("").Valid())
 }
@@ -288,4 +381,13 @@ func TestDeploymentValidate(t *testing.T) {
 			assert.ErrorContains(t, d.Validate(), field)
 		})
 	}
+
+	t.Run("an upload may omit contract_id", func(t *testing.T) {
+		// Bytecode is content-addressed by its wasm hash; there is no contract
+		// address to record until a deploy or upgrade names one.
+		upload := valid
+		upload.Action = store.ActionUpload
+		upload.ContractID = ""
+		assert.NoError(t, upload.Validate())
+	})
 }

@@ -3,7 +3,7 @@
 // The history is the point of the tool: it answers "which WASM hash is live on
 // which network, and who put it there" long after the terminal that ran the
 // deploy is gone. Two tables back that — contracts holds current state, and
-// deployments is an append-only log of every deploy and upgrade.
+// deployments is an append-only log of every deploy, upgrade, and upload.
 //
 // Everything is namespaced by network. A contract alias means nothing on its
 // own; "counter on testnet" and "counter on mainnet" are separate records with
@@ -33,12 +33,18 @@ const (
 	// ActionUpgrade replaces the bytecode of an already-deployed contract,
 	// keeping its address.
 	ActionUpgrade Action = "upgrade"
+
+	// ActionUpload installs bytecode on-chain without deploying or upgrading:
+	// the first half of a governance-driven upgrade, where the hash goes into
+	// a proposal and a separate party later calls the contract's upgrade
+	// function. No contract exists yet, so the record has no contract id.
+	ActionUpload Action = "upload"
 )
 
 // Valid reports whether a is a recognised action. The database enforces this
 // too; checking here produces a better error than a constraint violation.
 func (a Action) Valid() bool {
-	return a == ActionDeploy || a == ActionUpgrade
+	return a == ActionDeploy || a == ActionUpgrade || a == ActionUpload
 }
 
 func (a Action) String() string { return string(a) }
@@ -76,6 +82,18 @@ type Deployment struct {
 	TxHash string `json:"tx_hash,omitempty"`
 	Ledger uint32 `json:"ledger,omitempty"`
 
+	// GitCommit is the git commit hash the deploy/upgrade was recorded from.
+	// Empty string when run outside a git repository or when detection fails.
+	GitCommit string `json:"git_commit"`
+
+	// Dirty reports whether the working tree had uncommitted changes at the time
+	// of the deploy/upgrade. Set to true when inside a git repo with modifications.
+	Dirty bool `json:"dirty"`
+
+	// FeeCharged is the fee paid for the transaction, in stroops.
+	// Nullable: absent for a dry run, or if the fee cannot be determined.
+	FeeCharged *int64 `json:"fee_charged,omitempty"`
+
 	// Notes is free-form operator context, e.g. a ticket or release tag.
 	Notes string `json:"notes,omitempty"`
 
@@ -100,14 +118,30 @@ type Store interface {
 	// contracts across all networks.
 	ListContracts(ctx context.Context, network string) ([]Contract, error)
 
+	// ListContractsPage returns one page using the same network/alias ordering.
+	ListContractsPage(ctx context.Context, network string, limit, offset int) ([]Contract, error)
+
 	// RecordDeployment appends a history entry.
 	RecordDeployment(ctx context.Context, d Deployment) (Deployment, error)
 
 	// History returns a contract's deployments, newest first.
 	History(ctx context.Context, network, alias string) ([]Deployment, error)
 
+	// HistoryPage returns one newest-first page of a contract's deployment log.
+	HistoryPage(ctx context.Context, network, alias string, limit, offset int) ([]Deployment, error)
+
 	// Close releases resources held by the store.
 	Close() error
+}
+
+func validatePage(limit, offset int) error {
+	if limit < 1 {
+		return fmt.Errorf("page limit must be positive")
+	}
+	if offset < 0 {
+		return fmt.Errorf("page offset must be non-negative")
+	}
+	return nil
 }
 
 // Validate checks a deployment record before it is written, so that bad data is
@@ -118,13 +152,15 @@ func (d Deployment) Validate() error {
 		return fmt.Errorf("deployment: alias is required")
 	case d.Network == "":
 		return fmt.Errorf("deployment: network is required")
-	case d.ContractID == "":
+	// An upload installs bytecode, which is content-addressed by its wasm hash
+	// and has no contract address; only a deploy or upgrade names a contract.
+	case d.ContractID == "" && d.Action != ActionUpload:
 		return fmt.Errorf("deployment: contract_id is required")
 	case d.WasmHash == "":
 		return fmt.Errorf("deployment: wasm_hash is required")
 	case !d.Action.Valid():
-		return fmt.Errorf("deployment: action must be %q or %q, got %q",
-			ActionDeploy, ActionUpgrade, d.Action)
+		return fmt.Errorf("deployment: action must be %q, %q, or %q, got %q",
+			ActionDeploy, ActionUpgrade, ActionUpload, d.Action)
 	case d.DeployerPubkey == "":
 		return fmt.Errorf("deployment: deployer_pubkey is required")
 	}

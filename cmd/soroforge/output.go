@@ -136,86 +136,46 @@ func printUpgradeResult(r *deploy.UpgradeResult) error {
 	return nil
 }
 
-// printEstimatedFees renders a dry run's per-transaction and total cost. The
-// figures come from simulation, so they are labelled as estimates rather than
-// promises: the network can charge differently by the time a real deploy runs.
-func printEstimatedFees(w io.Writer, f *deploy.DryRunFees) {
-	if f == nil {
-		return
+func printUploadResult(r *deploy.UploadResult) error {
+	if flags.jsonOutput {
+		return printJSON(r)
 	}
 
-	fmt.Fprintf(w, "\nEstimated fees (from simulation; the actual fee may differ):\n")
-	for _, row := range []struct {
-		label string
-		fee   *deploy.FeeEstimate
-	}{
-		{"upload", f.Upload},
-		{"create", f.Create},
-		{"upgrade", f.Upgrade},
-	} {
-		if row.fee == nil {
-			continue
-		}
-		fmt.Fprintf(w, "  %-8s %d stroops (%s XLM)\n", row.label, row.fee.TotalStroops, row.fee.TotalXLM)
-	}
-	fmt.Fprintf(w, "  %-8s %d stroops (%s XLM)\n", "total", f.Total.TotalStroops, f.Total.TotalXLM)
-}
+	w := out()
 
-// stderrIsTerminal reports whether stderr is a character device. Only then is
-// in-place progress output safe; pipes, files, and CI logs are not.
-func stderrIsTerminal() bool {
-	info, err := os.Stderr.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
-}
-
-// progressFor returns a progress printer when progress should be shown: always
-// with --progress, and otherwise only when stderr is a terminal. It returns nil
-// when progress is off, which leaves the service silent.
-func progressFor(force bool) deploy.ProgressFunc {
-	interactive := stderrIsTerminal()
-	if !force && !interactive {
+	if r.UploadSkipped {
+		fmt.Fprintf(w, "%s's bytecode is already on-chain on %s — nothing to upload.\n\n",
+			r.Alias, r.Network)
+		fmt.Fprintf(w, "  WASM hash     %s\n", r.WasmHash)
+		fmt.Fprintf(w, "  Deployer      %s\n", r.Deployer)
 		return nil
 	}
-	return progressPrinter(os.Stderr, interactive)
-}
 
-// progressPrinter renders deploy progress to w. On a terminal each event
-// rewrites a single line; elsewhere each event is its own line, which is what
-// a CI log wants.
-func progressPrinter(w io.Writer, interactive bool) deploy.ProgressFunc {
-	if !interactive {
-		return func(ev deploy.ProgressEvent) {
-			fmt.Fprintln(w, progressLine(ev))
-		}
+	if r.DryRun {
+		fmt.Fprintf(w, "Dry run — nothing was submitted and nothing was recorded.\n\n")
+	} else {
+		fmt.Fprintf(w, "Uploaded %s's bytecode to %s.\n\n", r.Alias, r.Network)
 	}
-	return func(ev deploy.ProgressEvent) {
-		line := progressLine(ev)
-		if ev.Phase == deploy.ProgressConfirmed {
-			fmt.Fprintf(w, "\r\033[K%s\n", line)
-			return
-		}
-		fmt.Fprintf(w, "\r\033[K%s", line)
-	}
-}
 
-// progressLine renders one event as a single line of text.
-func progressLine(ev deploy.ProgressEvent) string {
-	prefix := fmt.Sprintf("%s on %s: %s", ev.Alias, ev.Network, ev.Step)
-	switch ev.Phase {
-	case deploy.ProgressSimulating:
-		return prefix + ": simulating…"
-	case deploy.ProgressSubmitted:
-		return fmt.Sprintf("%s: submitted (%s)", prefix, shortHash(ev.Hash))
-	case deploy.ProgressWaiting:
-		return fmt.Sprintf("%s: waiting for ledger %d…", prefix, ev.Ledger)
-	case deploy.ProgressConfirmed:
-		return fmt.Sprintf("%s: confirmed in ledger %d", prefix, ev.Ledger)
-	default:
-		return prefix + ": " + ev.Phase
+	fmt.Fprintf(w, "  WASM hash     %s\n", r.WasmHash)
+	fmt.Fprintf(w, "  Network       %s\n", r.Network)
+	fmt.Fprintf(w, "  Deployer      %s\n", r.Deployer)
+	if r.MinResourceFee != 0 {
+		fmt.Fprintf(w, "  Resource fee  %d stroops\n", r.MinResourceFee)
 	}
+	if r.UploadTxHash != "" {
+		fmt.Fprintf(w, "  Upload tx     %s\n", r.UploadTxHash)
+	}
+	if r.Ledger != 0 {
+		fmt.Fprintf(w, "  Ledger        %d\n", r.Ledger)
+	}
+
+	if r.DryRun && r.UploadEnvelopeXDR != "" {
+		fmt.Fprintf(w, "\nAssembled upload envelope (unsigned):\n\n  %s\n", r.UploadEnvelopeXDR)
+		fmt.Fprintf(w, "\nRe-run without --dry-run to submit.\n")
+	}
+
+	return nil
 }
 
 // printCatalog reports SoroVault registration. A failure is shown as a
@@ -268,14 +228,29 @@ func printHistory(alias, network string, deployments []store.Deployment) error {
 	fmt.Fprintf(out(), "History for %s on %s (newest first):\n\n", alias, network)
 
 	tw := tabwriter.NewWriter(out(), 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "WHEN\tACTION\tWASM HASH\tDEPLOYER\tLEDGER\tTX\tNOTES")
+	fmt.Fprintln(tw, "WHEN\tACTION\tWASM HASH\tDEPLOYER\tLEDGER\tFEE (STROOPS)\tFEE (XLM)\tCOMMIT\tTX\tNOTES")
 	for _, d := range deployments {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		feeStroops, feeXLM := "-", "-"
+		if d.FeeCharged != nil {
+			feeStroops = fmt.Sprintf("%d", *d.FeeCharged)
+			feeXLM = fmt.Sprintf("%d.%07d", *d.FeeCharged/10_000_000, *d.FeeCharged%10_000_000)
+		}
+		commit := "-"
+		if d.GitCommit != "" {
+			commit = shortHash(d.GitCommit)
+			if d.Dirty {
+				commit += "*"
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			formatTime(d.CreatedAt),
 			d.Action,
 			shortHash(d.WasmHash),
 			shortHash(d.DeployerPubkey),
 			formatLedger(d.Ledger),
+			feeStroops,
+			feeXLM,
+			commit,
 			shortHash(d.TxHash),
 			truncate(d.Notes, 40),
 		)

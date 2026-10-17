@@ -12,10 +12,11 @@ import (
 
 // UpgradeRequest asks for a tracked contract's bytecode to be replaced.
 type UpgradeRequest struct {
-	Alias   string `json:"alias"`
-	Network string `json:"network,omitempty"`
-	Notes   string `json:"notes,omitempty"`
-	DryRun  bool   `json:"dry_run,omitempty"`
+	Alias     string `json:"alias"`
+	Network   string `json:"network,omitempty"`
+	Notes     string `json:"notes,omitempty"`
+	DryRun    bool   `json:"dry_run,omitempty"`
+	GitCommit string `json:"git_commit,omitempty"`
 }
 
 // UpgradeResult describes a completed or simulated upgrade.
@@ -140,24 +141,15 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 	}
 
 	// Step 1: make the new bytecode available on-chain.
-	fees := &DryRunFees{}
-	uploaded, err := stellar.WasmUploaded(ctx, r.Client, wasmHash)
+	upload, skipped, err := s.uploadBytecode(ctx, r, signer, wasm, req.DryRun, log)
 	if err != nil {
-		return nil, fmt.Errorf("check whether wasm is already uploaded: %w", err)
+		return nil, err
 	}
-	if uploaded {
-		log.Info("wasm already on-chain, skipping upload")
+	if skipped {
 		result.UploadSkipped = true
 	} else {
-		upload, err := s.runTransaction(ctx, r,
-			stellar.UploadWasmOp(wasm, signer.Address()), "upload", req.DryRun)
-		if err != nil {
-			return nil, fmt.Errorf("upload wasm: %w", err)
-		}
 		result.UploadTxHash = upload.Hash
 		result.UploadEnvelopeXDR = upload.EnvelopeXDR
-		fees.Upload = &upload.Fee
-		log.Info("wasm uploaded", "tx_hash", upload.Hash)
 	}
 
 	// Step 2: ask the contract to upgrade itself.
@@ -199,6 +191,8 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		"to_wasm_hash", wasmHashHex,
 		"tx_hash", upgrade.Hash)
 
+	gitCommit, dirty := gitMetadata(s.cfg.Dir(), req.GitCommit)
+
 	deployment, err := s.record(ctx, store.Deployment{
 		Alias:          r.Alias,
 		Network:        r.NetworkName,
@@ -209,6 +203,9 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		TxHash:         upgrade.Hash,
 		Ledger:         upgrade.Ledger,
 		Notes:          req.Notes,
+		GitCommit:      gitCommit,
+		Dirty:          dirty,
+		FeeCharged:     upgrade.FeeCharged,
 	})
 	if err != nil {
 		return nil, err
