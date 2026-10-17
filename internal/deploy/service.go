@@ -177,6 +177,7 @@ type DryRunFees struct {
 	Upload  *FeeEstimate `json:"upload,omitempty"`
 	Create  *FeeEstimate `json:"create,omitempty"`
 	Upgrade *FeeEstimate `json:"upgrade,omitempty"`
+	Init    *FeeEstimate `json:"init,omitempty"`
 
 	Total FeeEstimate `json:"total"`
 }
@@ -184,7 +185,7 @@ type DryRunFees struct {
 // sum totals the per-transaction estimates.
 func (f *DryRunFees) sum() FeeEstimate {
 	var total FeeEstimate
-	for _, e := range []*FeeEstimate{f.Upload, f.Create, f.Upgrade} {
+	for _, e := range []*FeeEstimate{f.Upload, f.Create, f.Upgrade, f.Init} {
 		if e == nil {
 			continue
 		}

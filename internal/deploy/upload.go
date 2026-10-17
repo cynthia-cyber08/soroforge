@@ -120,6 +120,7 @@ func (s *Service) Upload(ctx context.Context, req UploadRequest) (*UploadResult,
 		TxHash:         upload.Hash,
 		Ledger:         upload.Ledger,
 		Notes:          req.Notes,
+		CIRunURL:       ciRunURL(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -155,7 +156,7 @@ func (s *Service) uploadBytecode(
 		return txResult{}, true, nil
 	}
 
-	upload, err := s.runTransaction(ctx, r, stellar.UploadWasmOp(wasm, signer.Address()), dryRun)
+	upload, err := s.runTransaction(ctx, r, stellar.UploadWasmOp(wasm, signer.Address()), "upload", dryRun)
 	if err != nil {
 		return txResult{}, false, fmt.Errorf("upload wasm: %w", err)
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/soroworks/soroforge/internal/config"
 	"github.com/soroworks/soroforge/internal/stellar"
 	"github.com/soroworks/soroforge/internal/store"
+	"github.com/stellar/go-stellar-sdk/txnbuild"
 )
 
 func gitMetadata(dir, override string) (string, bool) {
@@ -66,6 +67,10 @@ type DeployResult struct {
 	UploadTxHash string `json:"upload_tx_hash,omitempty"`
 	CreateTxHash string `json:"create_tx_hash,omitempty"`
 
+	// InitTxHash is the transaction hash of the initializer invocation, when
+	// init_fn is configured. Empty on a dry run or when no initializer is used.
+	InitTxHash string `json:"init_tx_hash,omitempty"`
+
 	Ledger uint32 `json:"ledger,omitempty"`
 
 	// DryRun reports whether anything was actually submitted.
@@ -80,6 +85,9 @@ type DeployResult struct {
 	// diffed, or submitted by another tool.
 	UploadEnvelopeXDR string `json:"upload_envelope_xdr,omitempty"`
 	CreateEnvelopeXDR string `json:"create_envelope_xdr,omitempty"`
+
+	// InitEnvelopeXDR is the assembled initializer transaction envelope.
+	InitEnvelopeXDR string `json:"init_envelope_xdr,omitempty"`
 
 	// UploadSkipped reports that the bytecode was already on-chain.
 	UploadSkipped bool `json:"upload_skipped,omitempty"`
@@ -132,6 +140,22 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 		DryRun:   req.DryRun,
 	}
 
+	salt, err := s.salt(r.Contract)
+	if err != nil {
+		return nil, err
+	}
+
+	// A fixed salt makes the target address deterministic, so a collision can
+	// be caught before the bytecode upload is paid for. A random salt cannot
+	// collide in any way worth checking, so that path skips the lookup.
+	if r.Contract.Salt != "" {
+		if err := s.checkTargetFree(ctx, r, signer.Address(), salt); err != nil {
+			return nil, err
+		}
+	}
+
+	fees := &DryRunFees{}
+
 	// Step 1: upload the bytecode, unless it is already on-chain.
 	upload, skipped, err := s.uploadBytecode(ctx, r, signer, wasm, req.DryRun, log)
 	if err != nil {
@@ -142,6 +166,7 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 	} else {
 		result.UploadTxHash = upload.Hash
 		result.UploadEnvelopeXDR = upload.EnvelopeXDR
+		fees.Upload = &upload.Fee
 	}
 
 	// Step 2: instantiate a contract from the uploaded bytecode.
@@ -174,7 +199,29 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 	}
 	result.ContractID = contractID
 
+	// Step 3: if an initializer function is configured, prepare its invocation.
+	var initOp *txnbuild.InvokeHostFunction
+	if r.Contract.InitFunc != "" {
+		initArgs, err := config.ArgsToScVals(r.Contract.InitArgs)
+		if err != nil {
+			return nil, fmt.Errorf("init args for %s: %w", r.Alias, err)
+		}
+		initOp, err = stellar.InvokeOp(contractID, r.Contract.InitFunc, initArgs, signer.Address())
+		if err != nil {
+			return nil, fmt.Errorf("build init op: %w", err)
+		}
+	}
+
 	if req.DryRun {
+		if initOp != nil {
+			initTx, err := s.runTransaction(ctx, r, initOp, "init", true)
+			if err != nil {
+				return nil, fmt.Errorf("simulate initializer %s: %w", r.Contract.InitFunc, err)
+			}
+			result.InitEnvelopeXDR = initTx.EnvelopeXDR
+			fees.Init = &initTx.Fee
+			fees.Total = fees.sum()
+		}
 		result.EstimatedFees = fees
 		log.Info("dry run complete, nothing submitted or recorded", "contract_id", contractID)
 		return result, nil
@@ -182,9 +229,40 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 
 	log.Info("contract created", "contract_id", contractID, "tx_hash", create.Hash)
 
-	// Record only now, after the network has confirmed both transactions.
 	gitCommit, dirty := gitMetadata(s.cfg.Dir(), req.GitCommit)
 
+	if initOp != nil {
+		initTx, err := s.runTransaction(ctx, r, initOp, "init", false)
+		if err != nil {
+			// The contract is already live on-chain, so record it honestly even though initialization failed.
+			failNotes := req.Notes
+			if failNotes != "" {
+				failNotes += " (uninitialised)"
+			} else {
+				failNotes = "uninitialised"
+			}
+			_, _ = s.record(ctx, store.Deployment{
+				Alias:          r.Alias,
+				Network:        r.NetworkName,
+				ContractID:     contractID,
+				WasmHash:       wasmHashHex,
+				Action:         store.ActionDeploy,
+				DeployerPubkey: signer.Address(),
+				TxHash:         create.Hash,
+				Ledger:         create.Ledger,
+				Notes:          failNotes,
+				GitCommit:      gitCommit,
+				Dirty:          dirty,
+				FeeCharged:     create.FeeCharged,
+				CIRunURL:       ciRunURL(),
+			})
+			return result, fmt.Errorf("contract %s is deployed at %s but uninitialised: %w", r.Alias, contractID, err)
+		}
+		result.InitTxHash = initTx.Hash
+		log.Info("contract initialized", "contract_id", contractID, "init_fn", r.Contract.InitFunc, "tx_hash", initTx.Hash)
+	}
+
+	// Record only now, after the network has confirmed transactions.
 	deployment, err := s.record(ctx, store.Deployment{
 		Alias:          r.Alias,
 		Network:        r.NetworkName,
@@ -198,6 +276,7 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 		GitCommit:      gitCommit,
 		Dirty:          dirty,
 		FeeCharged:     create.FeeCharged,
+		CIRunURL:       ciRunURL(),
 	})
 	if err != nil {
 		return nil, err

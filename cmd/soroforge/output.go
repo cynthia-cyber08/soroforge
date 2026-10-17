@@ -63,8 +63,14 @@ func printDeployResult(r *deploy.DeployResult) error {
 	if r.CreateTxHash != "" {
 		fmt.Fprintf(w, "  Create tx     %s\n", r.CreateTxHash)
 	}
+	if r.InitTxHash != "" {
+		fmt.Fprintf(w, "  Init tx       %s\n", r.InitTxHash)
+	}
 	if r.Ledger != 0 {
 		fmt.Fprintf(w, "  Ledger        %d\n", r.Ledger)
+	}
+	if r.Deployment != nil && r.Deployment.CIRunURL != "" {
+		fmt.Fprintf(w, "  CI run        %s\n", r.Deployment.CIRunURL)
 	}
 	printCatalog(w, r.Catalog)
 
@@ -77,6 +83,9 @@ func printDeployResult(r *deploy.DeployResult) error {
 		}
 		if r.CreateEnvelopeXDR != "" {
 			fmt.Fprintf(w, "\n  create:\n  %s\n", r.CreateEnvelopeXDR)
+		}
+		if r.InitEnvelopeXDR != "" {
+			fmt.Fprintf(w, "\n  init:\n  %s\n", r.InitEnvelopeXDR)
 		}
 		fmt.Fprintf(w, "\nRe-run without --dry-run to submit.\n")
 	}
@@ -122,6 +131,9 @@ func printUpgradeResult(r *deploy.UpgradeResult) error {
 	if r.Ledger != 0 {
 		fmt.Fprintf(w, "  Ledger        %d\n", r.Ledger)
 	}
+	if r.Deployment != nil && r.Deployment.CIRunURL != "" {
+		fmt.Fprintf(w, "  CI run        %s\n", r.Deployment.CIRunURL)
+	}
 	printCatalog(w, r.Catalog)
 
 	if r.DryRun {
@@ -134,6 +146,89 @@ func printUpgradeResult(r *deploy.UpgradeResult) error {
 	}
 
 	return nil
+}
+
+// printEstimatedFees renders a dry run's per-transaction and total cost. The
+// figures come from simulation, so they are labelled as estimates rather than
+// promises: the network can charge differently by the time a real deploy runs.
+func printEstimatedFees(w io.Writer, f *deploy.DryRunFees) {
+	if f == nil {
+		return
+	}
+
+	fmt.Fprintf(w, "\nEstimated fees (from simulation; the actual fee may differ):\n")
+	for _, row := range []struct {
+		label string
+		fee   *deploy.FeeEstimate
+	}{
+		{"upload", f.Upload},
+		{"create", f.Create},
+		{"upgrade", f.Upgrade},
+		{"init", f.Init},
+	} {
+		if row.fee == nil {
+			continue
+		}
+		fmt.Fprintf(w, "  %-8s %d stroops (%s XLM)\n", row.label, row.fee.TotalStroops, row.fee.TotalXLM)
+	}
+	fmt.Fprintf(w, "  %-8s %d stroops (%s XLM)\n", "total", f.Total.TotalStroops, f.Total.TotalXLM)
+}
+
+// stderrIsTerminal reports whether stderr is a character device. Only then is
+// in-place progress output safe; pipes, files, and CI logs are not.
+func stderrIsTerminal() bool {
+	info, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// progressFor returns a progress printer when progress should be shown: always
+// with --progress, and otherwise only when stderr is a terminal. It returns nil
+// when progress is off, which leaves the service silent.
+func progressFor(force bool) deploy.ProgressFunc {
+	interactive := stderrIsTerminal()
+	if !force && !interactive {
+		return nil
+	}
+	return progressPrinter(os.Stderr, interactive)
+}
+
+// progressPrinter renders deploy progress to w. On a terminal each event
+// rewrites a single line; elsewhere each event is its own line, which is what
+// a CI log wants.
+func progressPrinter(w io.Writer, interactive bool) deploy.ProgressFunc {
+	if !interactive {
+		return func(ev deploy.ProgressEvent) {
+			fmt.Fprintln(w, progressLine(ev))
+		}
+	}
+	return func(ev deploy.ProgressEvent) {
+		line := progressLine(ev)
+		if ev.Phase == deploy.ProgressConfirmed {
+			fmt.Fprintf(w, "\r\033[K%s\n", line)
+			return
+		}
+		fmt.Fprintf(w, "\r\033[K%s", line)
+	}
+}
+
+// progressLine renders one event as a single line of text.
+func progressLine(ev deploy.ProgressEvent) string {
+	prefix := fmt.Sprintf("%s on %s: %s", ev.Alias, ev.Network, ev.Step)
+	switch ev.Phase {
+	case deploy.ProgressSimulating:
+		return prefix + ": simulating…"
+	case deploy.ProgressSubmitted:
+		return fmt.Sprintf("%s: submitted (%s)", prefix, shortHash(ev.Hash))
+	case deploy.ProgressWaiting:
+		return fmt.Sprintf("%s: waiting for ledger %d…", prefix, ev.Ledger)
+	case deploy.ProgressConfirmed:
+		return fmt.Sprintf("%s: confirmed in ledger %d", prefix, ev.Ledger)
+	default:
+		return prefix + ": " + ev.Phase
+	}
 }
 
 func printUploadResult(r *deploy.UploadResult) error {
@@ -169,9 +264,49 @@ func printUploadResult(r *deploy.UploadResult) error {
 	if r.Ledger != 0 {
 		fmt.Fprintf(w, "  Ledger        %d\n", r.Ledger)
 	}
+	if r.Deployment != nil && r.Deployment.CIRunURL != "" {
+		fmt.Fprintf(w, "  CI run        %s\n", r.Deployment.CIRunURL)
+	}
 
 	if r.DryRun && r.UploadEnvelopeXDR != "" {
 		fmt.Fprintf(w, "\nAssembled upload envelope (unsigned):\n\n  %s\n", r.UploadEnvelopeXDR)
+		fmt.Fprintf(w, "\nRe-run without --dry-run to submit.\n")
+	}
+
+	return nil
+}
+
+func printInvokeResult(r *deploy.InvokeResult) error {
+	if flags.jsonOutput {
+		return printJSON(r)
+	}
+
+	w := out()
+
+	if r.DryRun {
+		fmt.Fprintf(w, "Dry run — nothing was submitted and nothing was recorded.\n\n")
+	} else {
+		fmt.Fprintf(w, "Invoked %s on %s (%s).\n\n", r.Function, r.Alias, r.Network)
+	}
+
+	fmt.Fprintf(w, "  Contract ID   %s\n", r.ContractID)
+	fmt.Fprintf(w, "  Function      %s\n", r.Function)
+	if len(r.Args) > 0 {
+		fmt.Fprintf(w, "  Arguments     %s\n", strings.Join(r.Args, " "))
+	}
+	fmt.Fprintf(w, "  Deployer      %s\n", r.Deployer)
+	if r.TxHash != "" {
+		fmt.Fprintf(w, "  Tx hash       %s\n", r.TxHash)
+	}
+	if r.Ledger != 0 {
+		fmt.Fprintf(w, "  Ledger        %d\n", r.Ledger)
+	}
+	if r.Deployment != nil && r.Deployment.CIRunURL != "" {
+		fmt.Fprintf(w, "  CI run        %s\n", r.Deployment.CIRunURL)
+	}
+
+	if r.DryRun && r.EnvelopeXDR != "" {
+		fmt.Fprintf(w, "\nAssembled invocation envelope (unsigned):\n\n  %s\n", r.EnvelopeXDR)
 		fmt.Fprintf(w, "\nRe-run without --dry-run to submit.\n")
 	}
 
@@ -228,7 +363,7 @@ func printHistory(alias, network string, deployments []store.Deployment) error {
 	fmt.Fprintf(out(), "History for %s on %s (newest first):\n\n", alias, network)
 
 	tw := tabwriter.NewWriter(out(), 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "WHEN\tACTION\tWASM HASH\tDEPLOYER\tLEDGER\tFEE (STROOPS)\tFEE (XLM)\tCOMMIT\tTX\tNOTES")
+	fmt.Fprintln(tw, "WHEN\tACTION\tWASM HASH\tDEPLOYER\tLEDGER\tFEE (STROOPS)\tFEE (XLM)\tCOMMIT\tTX\tCI RUN\tNOTES")
 	for _, d := range deployments {
 		feeStroops, feeXLM := "-", "-"
 		if d.FeeCharged != nil {
@@ -242,7 +377,25 @@ func printHistory(alias, network string, deployments []store.Deployment) error {
 				commit += "*"
 			}
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		ciRun := "-"
+		if d.CIRunURL != "" {
+			ciRun = d.CIRunURL
+		}
+		notes := d.Notes
+		if d.Action == store.ActionInvoke && d.FnName != "" {
+			inv := d.FnName
+			if d.FnArgs != "" {
+				inv += "(" + d.FnArgs + ")"
+			} else {
+				inv += "()"
+			}
+			if notes != "" {
+				notes = inv + " - " + notes
+			} else {
+				notes = inv
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			formatTime(d.CreatedAt),
 			d.Action,
 			shortHash(d.WasmHash),
@@ -252,7 +405,8 @@ func printHistory(alias, network string, deployments []store.Deployment) error {
 			feeXLM,
 			commit,
 			shortHash(d.TxHash),
-			truncate(d.Notes, 40),
+			ciRun,
+			truncate(notes, 40),
 		)
 	}
 	return tw.Flush()
