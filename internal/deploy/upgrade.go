@@ -40,6 +40,10 @@ type UpgradeResult struct {
 
 	DryRun bool `json:"dry_run"`
 
+	// EstimatedFees is what a dry run estimates each transaction would cost.
+	// Nil unless DryRun is set.
+	EstimatedFees *DryRunFees `json:"estimated_fees,omitempty"`
+
 	UploadEnvelopeXDR  string `json:"upload_envelope_xdr,omitempty"`
 	UpgradeEnvelopeXDR string `json:"upgrade_envelope_xdr,omitempty"`
 
@@ -136,6 +140,7 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 	}
 
 	// Step 1: make the new bytecode available on-chain.
+	fees := &DryRunFees{}
 	uploaded, err := stellar.WasmUploaded(ctx, r.Client, wasmHash)
 	if err != nil {
 		return nil, fmt.Errorf("check whether wasm is already uploaded: %w", err)
@@ -145,12 +150,13 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		result.UploadSkipped = true
 	} else {
 		upload, err := s.runTransaction(ctx, r,
-			stellar.UploadWasmOp(wasm, signer.Address()), req.DryRun)
+			stellar.UploadWasmOp(wasm, signer.Address()), "upload", req.DryRun)
 		if err != nil {
 			return nil, fmt.Errorf("upload wasm: %w", err)
 		}
 		result.UploadTxHash = upload.Hash
 		result.UploadEnvelopeXDR = upload.EnvelopeXDR
+		fees.Upload = &upload.Fee
 		log.Info("wasm uploaded", "tx_hash", upload.Hash)
 	}
 
@@ -172,15 +178,18 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		return nil, err
 	}
 
-	upgrade, err := s.runTransaction(ctx, r, invokeOp, req.DryRun)
+	upgrade, err := s.runTransaction(ctx, r, invokeOp, "upgrade", req.DryRun)
 	if err != nil {
 		return nil, fmt.Errorf("invoke %s on %s: %w", upgradeFunc, tracked.ContractID, err)
 	}
 	result.UpgradeTxHash = upgrade.Hash
 	result.UpgradeEnvelopeXDR = upgrade.EnvelopeXDR
 	result.Ledger = upgrade.Ledger
+	fees.Upgrade = &upgrade.Fee
+	fees.Total = fees.sum()
 
 	if req.DryRun {
+		result.EstimatedFees = fees
 		log.Info("dry run complete, nothing submitted or recorded")
 		return result, nil
 	}

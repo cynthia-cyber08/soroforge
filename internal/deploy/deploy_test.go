@@ -53,6 +53,9 @@ type harnessOptions struct {
 
 	// catalog replaces the SoroVault registrar.
 	catalog catalog.Registrar
+
+	// progress receives deploy progress events, when set.
+	progress deploy.ProgressFunc
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -108,8 +111,9 @@ contracts:
 		Signer:  signer,
 		Clients: func(string, config.Network) (stellar.Client, error) { return client, nil },
 		// Discard logs so test output stays readable.
-		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Catalog: opts.catalog,
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Catalog:  opts.catalog,
+		Progress: opts.progress,
 	})
 	require.NoError(t, err)
 

@@ -59,6 +59,9 @@ type Service struct {
 
 	// catalog publishes confirmed contracts to a network's sorovault_url.
 	catalog catalog.Registrar
+
+	// progress, when set, reports what a transaction is doing while it waits.
+	progress ProgressFunc
 }
 
 // Options configures a Service. Config, Store, and Signer are required.
@@ -87,6 +90,11 @@ type Options struct {
 	// sorovault_url, when one is configured. Defaults to a SoroVault HTTP
 	// client; tests replace it.
 	Catalog catalog.Registrar
+
+	// Progress receives progress events while transactions are in flight. It
+	// is the CLI's hook for showing that a deploy is not hung; the HTTP API
+	// leaves it nil, so service behaviour is identical with and without it.
+	Progress ProgressFunc
 }
 
 // DefaultConfirmTimeout bounds waiting for a transaction to be included.
@@ -136,7 +144,113 @@ func New(opts Options) (*Service, error) {
 		baseFee:        baseFee,
 		confirmTimeout: confirmTimeout,
 		catalog:        registrar,
+		progress:       opts.Progress,
 	}, nil
+}
+
+// FeeEstimate is the estimated cost of one transaction, in stroops and XLM.
+//
+// It is derived from simulation plus the configured base fee, so it matches
+// what a real submission would declare as its maximum fee. It is an estimate
+// because the network can change fee rates between simulation and submission.
+type FeeEstimate struct {
+	// InclusionFeeStroops is BaseFee × operations, the part that buys ledger
+	// space.
+	InclusionFeeStroops int64 `json:"inclusion_fee_stroops"`
+
+	// ResourceFeeStroops is the Soroban resource fee simulation reported.
+	ResourceFeeStroops int64 `json:"resource_fee_stroops"`
+
+	// TotalStroops is inclusion plus resource.
+	TotalStroops int64 `json:"total_stroops"`
+
+	// TotalXLM is TotalStroops converted to lumens.
+	TotalXLM string `json:"total_xlm"`
+}
+
+// DryRunFees is what a dry run estimates every transaction it assembled will
+// cost, per transaction and in total.
+//
+// Upload is absent when the bytecode was already on-chain, because a real
+// deploy would skip that transaction and its fee.
+type DryRunFees struct {
+	Upload  *FeeEstimate `json:"upload,omitempty"`
+	Create  *FeeEstimate `json:"create,omitempty"`
+	Upgrade *FeeEstimate `json:"upgrade,omitempty"`
+
+	Total FeeEstimate `json:"total"`
+}
+
+// sum totals the per-transaction estimates.
+func (f *DryRunFees) sum() FeeEstimate {
+	var total FeeEstimate
+	for _, e := range []*FeeEstimate{f.Upload, f.Create, f.Upgrade} {
+		if e == nil {
+			continue
+		}
+		total.InclusionFeeStroops += e.InclusionFeeStroops
+		total.ResourceFeeStroops += e.ResourceFeeStroops
+		total.TotalStroops += e.TotalStroops
+	}
+	total.TotalXLM = stellar.StroopsToXLM(total.TotalStroops)
+	return total
+}
+
+// feeEstimate builds an estimate from an assembled transaction's total fee and
+// the resource fee simulation reported. The two together are exactly the
+// figures Assemble folds into the envelope.
+func feeEstimate(totalFee, resourceFee int64) FeeEstimate {
+	return FeeEstimate{
+		InclusionFeeStroops: totalFee - resourceFee,
+		ResourceFeeStroops:  resourceFee,
+		TotalStroops:        totalFee,
+		TotalXLM:            stellar.StroopsToXLM(totalFee),
+	}
+}
+
+// Progress phases reported while a transaction is in flight. The strings are
+// part of the CLI's output contract but are not serialised anywhere.
+const (
+	ProgressSimulating = "simulating"
+	ProgressSubmitted  = "submitted"
+	ProgressWaiting    = "waiting"
+	ProgressConfirmed  = "confirmed"
+)
+
+// ProgressEvent describes one step of a deploy or upgrade. Step names the
+// host function being run ("upload", "create", or "upgrade") so a caller can
+// tell the two transactions of a deploy apart.
+type ProgressEvent struct {
+	Alias   string `json:"alias"`
+	Network string `json:"network"`
+	Step    string `json:"step"`
+	Phase   string `json:"phase"`
+
+	// Hash is the transaction hash once it is known.
+	Hash string `json:"hash,omitempty"`
+
+	// Ledger is, while waiting, the ledger being awaited, and once confirmed,
+	// the ledger that included the transaction.
+	Ledger uint32 `json:"ledger,omitempty"`
+}
+
+// ProgressFunc receives progress events. It runs on the caller's goroutine and
+// must not block for long.
+type ProgressFunc func(ProgressEvent)
+
+// report sends a progress event when a callback is configured.
+func (s *Service) report(r resolved, step, phase, hash string, ledger uint32) {
+	if s.progress == nil {
+		return
+	}
+	s.progress(ProgressEvent{
+		Alias:   r.Alias,
+		Network: r.NetworkName,
+		Step:    step,
+		Phase:   phase,
+		Hash:    hash,
+		Ledger:  ledger,
+	})
 }
 
 // CatalogStatus reports what happened when a confirmed contract was
@@ -235,6 +349,10 @@ type txResult struct {
 	// EnvelopeXDR is the assembled, signed envelope. On a dry run it is the
 	// assembled but unsigned envelope, and it is the whole point of the run.
 	EnvelopeXDR string
+
+	// Fee is the estimated cost of this transaction, from simulation plus the
+	// configured base fee.
+	Fee FeeEstimate
 }
 
 // runTransaction executes the full Soroban submission cycle for one operation:
@@ -244,10 +362,13 @@ type txResult struct {
 // The simulate-then-assemble step is mandatory rather than an optimisation. A
 // Soroban transaction must declare the exact ledger entries it touches and the
 // resources it consumes, and simulation is the only way to discover them.
+//
+// step labels the operation for progress events ("upload", "create", "upgrade").
 func (s *Service) runTransaction(
 	ctx context.Context,
 	r resolved,
 	op *txnbuild.InvokeHostFunction,
+	step string,
 	dryRun bool,
 ) (txResult, error) {
 	signer, err := s.requireSigner()
@@ -274,6 +395,8 @@ func (s *Service) runTransaction(
 		return txResult{}, fmt.Errorf("encode transaction: %w", err)
 	}
 
+	s.report(r, step, ProgressSimulating, "", 0)
+
 	sim, err := r.Client.Simulate(ctx, unsignedXDR)
 	if err != nil {
 		return txResult{}, err
@@ -284,6 +407,12 @@ func (s *Service) runTransaction(
 		return txResult{}, err
 	}
 
+	resourceFee, err := stellar.ResourceFee(sim)
+	if err != nil {
+		return txResult{}, err
+	}
+	fee := feeEstimate(assembled.MaxFee(), resourceFee)
+
 	if dryRun {
 		envelope, err := assembled.Base64()
 		if err != nil {
@@ -291,7 +420,7 @@ func (s *Service) runTransaction(
 		}
 		// Stop before signing. Nothing is sent and nothing is recorded; the
 		// envelope is returned for inspection.
-		return txResult{Simulation: sim, EnvelopeXDR: envelope}, nil
+		return txResult{Simulation: sim, EnvelopeXDR: envelope, Fee: fee}, nil
 	}
 
 	signed, err := signer.Sign(r.Client.NetworkPassphrase(), assembled)
@@ -310,17 +439,24 @@ func (s *Service) runTransaction(
 	if err := checkSendStatus(sent); err != nil {
 		return txResult{}, err
 	}
+	s.report(r, step, ProgressSubmitted, sent.Hash, 0)
+
+	// The latest closed ledger cannot include a transaction just accepted, so
+	// the next one is the earliest it can land in — that is what to wait for.
+	s.report(r, step, ProgressWaiting, sent.Hash, sent.LatestLedger+1)
 
 	confirmed, err := s.confirm(ctx, r.Client, sent.Hash)
 	if err != nil {
 		return txResult{}, err
 	}
+	s.report(r, step, ProgressConfirmed, confirmed.Hash, confirmed.Ledger)
 
 	return txResult{
 		Hash:        confirmed.Hash,
 		Ledger:      confirmed.Ledger,
 		Simulation:  sim,
 		EnvelopeXDR: signedXDR,
+		Fee:         fee,
 	}, nil
 }
 

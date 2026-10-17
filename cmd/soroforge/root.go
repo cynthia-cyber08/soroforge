@@ -60,6 +60,7 @@ The secret key is never logged, stored, or printed. See the README security note
 
 	cmd.AddCommand(
 		newInitCmd(),
+		newConfigCmd(),
 		newDeployCmd(),
 		newUpgradeCmd(),
 		newListCmd(),
@@ -133,6 +134,10 @@ type appOptions struct {
 	// friction with no purpose. Every command that writes history still
 	// insists on a real database.
 	storeOptional bool
+
+	// progress receives deploy progress events. Nil keeps the service silent,
+	// which is what read-only commands and `serve` want.
+	progress deploy.ProgressFunc
 }
 
 // newApp loads configuration, connects to Postgres, and builds the service.
@@ -168,10 +173,11 @@ func newApp(ctx context.Context, opts appOptions) (*app, error) {
 	}
 
 	service, err := deploy.New(deploy.Options{
-		Config: cfg,
-		Store:  a.store,
-		Signer: signer,
-		Log:    slog.Default(),
+		Config:   cfg,
+		Store:    a.store,
+		Signer:   signer,
+		Log:      slog.Default(),
+		Progress: opts.progress,
 	})
 	if err != nil {
 		_ = a.Close()

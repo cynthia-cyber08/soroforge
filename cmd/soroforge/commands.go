@@ -24,8 +24,9 @@ var version = "dev"
 
 func newDeployCmd() *cobra.Command {
 	var (
-		dryRun bool
-		notes  string
+		dryRun   bool
+		notes    string
+		progress bool
 	)
 
 	cmd := &cobra.Command{
@@ -38,8 +39,13 @@ its hash, then a contract instance is created from that hash. Both must confirm
 before anything is recorded.
 
 Use --dry-run to assemble and simulate the transactions without submitting
-them. A dry run prints the contract address a real deploy would produce and the
-assembled envelopes, and writes nothing to the database.`,
+them. A dry run prints the contract address a real deploy would produce, the
+estimated fees, and the assembled envelopes, and writes nothing to the
+database.
+
+Progress is written to stderr while waiting for confirmation, and only when
+stderr is a terminal, so stdout and --json stay clean. Use --progress to force
+it on in a pipe or log.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// A dry run writes nothing, so it does not need Postgres — that
@@ -47,6 +53,7 @@ assembled envelopes, and writes nothing to the database.`,
 			a, err := newApp(cmd.Context(), appOptions{
 				requireSigner: true,
 				storeOptional: dryRun,
+				progress:      progressFor(progress),
 			})
 			if err != nil {
 				return err
@@ -70,14 +77,17 @@ assembled envelopes, and writes nothing to the database.`,
 		"assemble and simulate without submitting or recording anything")
 	cmd.Flags().StringVar(&notes, "notes", "",
 		"free-form note recorded with this deployment (e.g. a ticket or release tag)")
+	cmd.Flags().BoolVar(&progress, "progress", false,
+		"show progress on stderr even when stderr is not a terminal")
 
 	return cmd
 }
 
 func newUpgradeCmd() *cobra.Command {
 	var (
-		dryRun bool
-		notes  string
+		dryRun   bool
+		notes    string
+		progress bool
 	)
 
 	cmd := &cobra.Command{
@@ -92,10 +102,17 @@ contract's own upgrade entrypoint — "upgrade" by default, or whatever
 function, or that rejects the caller, will fail here with its own error.
 
 The current hash is read from the ledger rather than the database, so an
-upgrade applied outside SoroForge is still reported accurately.`,
+upgrade applied outside SoroForge is still reported accurately.
+
+Progress is written to stderr while waiting for confirmation, and only when
+stderr is a terminal, so stdout and --json stay clean. Use --progress to force
+it on in a pipe or log.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			a, err := newApp(cmd.Context(), appOptions{requireSigner: true})
+			a, err := newApp(cmd.Context(), appOptions{
+				requireSigner: true,
+				progress:      progressFor(progress),
+			})
 			if err != nil {
 				return err
 			}
@@ -118,6 +135,8 @@ upgrade applied outside SoroForge is still reported accurately.`,
 		"assemble and simulate without submitting or recording anything")
 	cmd.Flags().StringVar(&notes, "notes", "",
 		"free-form note recorded with this upgrade")
+	cmd.Flags().BoolVar(&progress, "progress", false,
+		"show progress on stderr even when stderr is not a terminal")
 
 	return cmd
 }
