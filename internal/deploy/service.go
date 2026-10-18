@@ -62,6 +62,9 @@ type Service struct {
 
 	// progress, when set, reports what a transaction is doing while it waits.
 	progress ProgressFunc
+
+	// webhooks delivers notifications to endpoints configured on a network.
+	webhooks WebhookSender
 }
 
 // Options configures a Service. Config, Store, and Signer are required.
@@ -95,6 +98,10 @@ type Options struct {
 	// is the CLI's hook for showing that a deploy is not hung; the HTTP API
 	// leaves it nil, so service behaviour is identical with and without it.
 	Progress ProgressFunc
+
+	// Webhooks delivers notifications after confirmed deploys and upgrades.
+	// Defaults to NewHTTPWebhookSender(nil).
+	Webhooks WebhookSender
 }
 
 // DefaultConfirmTimeout bounds waiting for a transaction to be included.
@@ -134,6 +141,10 @@ func New(opts Options) (*Service, error) {
 	if registrar == nil {
 		registrar = catalog.NewSoroVault(nil)
 	}
+	webhooks := opts.Webhooks
+	if webhooks == nil {
+		webhooks = NewHTTPWebhookSender(nil)
+	}
 
 	return &Service{
 		cfg:            opts.Config,
@@ -145,6 +156,7 @@ func New(opts Options) (*Service, error) {
 		confirmTimeout: confirmTimeout,
 		catalog:        registrar,
 		progress:       opts.Progress,
+		webhooks:       webhooks,
 	}, nil
 }
 
@@ -289,6 +301,30 @@ func (s *Service) publish(ctx context.Context, r resolved, contractID string, lo
 	log.Info("contract registered with sorovault",
 		"contract_id", contractID, "url", entry.URL, "functions", entry.Functions)
 	return status
+}
+
+// notifyWebhooks delivers webhook notifications to every endpoint configured on
+// the network. Like publish, it is strictly best-effort: delivery failures are
+// logged and recorded in the returned statuses, but never fail the deploy.
+func (s *Service) notifyWebhooks(ctx context.Context, network config.Network, payload WebhookPayload, log *slog.Logger) []WebhookStatus {
+	if len(network.Webhooks) == 0 {
+		return nil
+	}
+
+	var results []WebhookStatus
+	for _, wh := range network.Webhooks {
+		status := WebhookStatus{URL: wh.URL}
+		if err := s.webhooks.Send(ctx, wh, payload); err != nil {
+			status.OK = false
+			status.Error = err.Error()
+			log.Warn("webhook delivery failed", "url", wh.URL, "error", err)
+		} else {
+			status.OK = true
+			log.Info("webhook delivered", "url", wh.URL)
+		}
+		results = append(results, status)
+	}
+	return results
 }
 
 // Config exposes the loaded configuration, for callers that need to render
