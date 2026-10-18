@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 
+	"github.com/stellar/go-stellar-sdk/network"
 	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
@@ -68,7 +69,9 @@ func ContractIDFromDeployer(networkPassphrase, deployer string, salt [32]byte) (
 		return "", fmt.Errorf("deployer address %q: %w", deployer, err)
 	}
 
-	networkID := sha256.Sum256([]byte(networkPassphrase))
+	// The network ID is the SHA-256 of the public network passphrase, as the
+	// protocol defines it; network.ID computes exactly that.
+	networkID := network.ID(networkPassphrase)
 	preimage := xdr.HashIdPreimage{
 		Type: xdr.EnvelopeTypeEnvelopeTypeContractId,
 		ContractId: &xdr.HashIdPreimageContractId{

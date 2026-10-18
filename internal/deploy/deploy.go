@@ -362,6 +362,6 @@ func (s *Service) checkTargetFree(ctx context.Context, r resolved, deployer stri
 			address, r.Alias, r.NetworkName, r.Alias)
 	}
 
-	s.log.Debug("target address is free", "alias", r.Alias, "contract_id", address)
+	s.log.Debug("target address is free", "contract_id", address)
 	return nil
 }
