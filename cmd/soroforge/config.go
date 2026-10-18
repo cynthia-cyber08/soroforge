@@ -14,11 +14,11 @@ import (
 func newConfigCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "config",
-		Short: "Inspect the configuration SoroForge resolves",
+		Short: "Inspect and validate the configuration SoroForge resolves",
 		Args:  cobra.NoArgs,
 	}
 
-	cmd.AddCommand(newConfigShowCmd())
+	cmd.AddCommand(newConfigShowCmd(), newConfigCheckCmd())
 	return cmd
 }
 

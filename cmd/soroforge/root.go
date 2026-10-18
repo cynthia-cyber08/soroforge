@@ -237,6 +237,7 @@ func newApp(ctx context.Context, opts appOptions) (*app, error) {
 		return nil, err
 	}
 	a.service = service
+	a.closers = append(a.closers, service.Close)
 
 	return a, nil
 }
