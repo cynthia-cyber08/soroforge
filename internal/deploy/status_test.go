@@ -17,6 +17,48 @@ import (
 // SoroForge's claim against the ledger rather than assuming the database is
 // right. These cases cover each way that comparison can come out.
 
+func TestStatusResultInSync(t *testing.T) {
+	tests := map[string]struct {
+		result deploy.StatusResult
+		want   bool
+	}{
+		"in sync": {
+			result: deploy.StatusResult{State: deploy.StateInSync},
+			want:   true,
+		},
+		"zero value has no state": {
+			result: deploy.StatusResult{},
+			want:   false,
+		},
+		"drift": {
+			result: deploy.StatusResult{State: deploy.StateDrift},
+			want:   false,
+		},
+		"untracked": {
+			result: deploy.StatusResult{State: deploy.StateUntracked},
+			want:   false,
+		},
+		"missing": {
+			result: deploy.StatusResult{State: deploy.StateMissing},
+			want:   false,
+		},
+		"archived": {
+			result: deploy.StatusResult{State: deploy.StateArchived},
+			want:   false,
+		},
+		"unknown state": {
+			result: deploy.StatusResult{State: deploy.State("something_new")},
+			want:   false,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.result.InSync())
+		})
+	}
+}
+
 func TestStatusInSync(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	trackContract(t, h, h.wasmHash)
